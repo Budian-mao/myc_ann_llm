@@ -126,6 +126,10 @@ class ItemTower(nn.Module):
 
 
 # InfoNCE损失函数
+import torch
+import torch.nn.functional as F
+
+
 def info_nce_loss(transformer_output, item_tower_output, temperature=0.1, debug=False):
     # 1. 最后维度归一化
     user_norm = F.normalize(transformer_output, dim=-1)
@@ -144,10 +148,19 @@ def info_nce_loss(transformer_output, item_tower_output, temperature=0.1, debug=
     # 计算相似度矩阵 (dot product)
     sim_matrix = torch.matmul(user_flat, item_flat.T)  # [L, L]
 
-    # 4. 创建掩码矩阵：正样本位置为1，其他为0
-    mask = torch.zeros_like(sim_matrix)
+    # 4. 创建掩码矩阵
+    # 正样本掩码：对角线为1，其他为0
+    pos_mask = torch.zeros_like(sim_matrix)
     diag_indices = torch.arange(L, device=sim_matrix.device)
-    mask[diag_indices, diag_indices] = 1.0
+    pos_mask[diag_indices, diag_indices] = 1.0
+
+    # 负样本掩码：只保留其他用户的样本
+    neg_mask = torch.ones_like(sim_matrix)
+    for i in range(batch_size):
+        start_idx = i * seq_len_minus_1
+        end_idx = (i + 1) * seq_len_minus_1
+        # 排除当前用户的所有item
+        neg_mask[start_idx:end_idx, start_idx:end_idx] = 0.0
 
     # 5. 计算InfoNCE损失
     # 应用温度缩放
@@ -156,13 +169,12 @@ def info_nce_loss(transformer_output, item_tower_output, temperature=0.1, debug=
     # 计算softmax
     exp_sim = torch.exp(sim_matrix)
 
-    # 计算每个样本的分母（排除自身的所有样本）
-    # 这里使用掩码排除正样本，同时添加一个很小的值保证数值稳定性
-    denominator = torch.sum(exp_sim * (1 - mask), dim=1, keepdim=True) + 1e-8
+    # 计算分母：只包含其他用户的样本
+    # 添加一个很小的值保证数值稳定性
+    denominator = torch.sum(exp_sim * neg_mask, dim=1, keepdim=True) +1e-8
 
     # 计算每个样本的损失
-    # 注意：正样本的sim_matrix值已经包含在分子中
-    pos_sim = torch.sum(sim_matrix * mask, dim=1)  # 正样本相似度
+    pos_sim = torch.sum(sim_matrix * pos_mask, dim=1)  # 正样本相似度
     loss_per_sample = -torch.log(exp_sim[diag_indices, diag_indices] / denominator.squeeze())
 
     # 计算平均损失
@@ -172,9 +184,14 @@ def info_nce_loss(transformer_output, item_tower_output, temperature=0.1, debug=
     if debug:
         # 统计正样本和负样本的平均相似度
         pos_sim_avg = torch.mean(sim_matrix[diag_indices, diag_indices])
-        neg_sim_avg = torch.sum(sim_matrix * (1 - mask)) / (L * (L - 1))
+        neg_sim_avg = torch.sum(sim_matrix * neg_mask) / torch.sum(neg_mask)
+
+        # 计算每个样本的负样本数量
+        num_negatives = torch.sum(neg_mask, dim=1).float()
+        avg_negatives = torch.mean(num_negatives)
 
         print(f"Batch大小: {batch_size}, 序列长度: {seq_len_minus_1 + 1}, 总样本数: {L}")
+        print(f"每个样本的平均负样本数: {avg_negatives.item():.2f}")
         print(f"正样本平均相似度: {pos_sim_avg.item():.4f}, 负样本平均相似度: {neg_sim_avg.item():.4f}")
         print(f"正样本概率分布: {torch.mean(exp_sim[diag_indices, diag_indices] / denominator.squeeze()).item():.4f}")
         print(f"最终损失: {final_loss.item():.4f}")
@@ -190,7 +207,7 @@ if __name__ == "__main__":
     num_layers = 2
     hidden_dim = 128
     vocab_size = 100001  # 确保覆盖所有item_id和category_id
-    batch_size = 3
+    batch_size = 300
     epochs = 1
     learning_rate = 0.001
 
