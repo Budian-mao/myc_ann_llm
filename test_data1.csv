@@ -1,0 +1,2 @@
+sample_id,user_id,item_seq_item_id,item_seq_category_id,item_seq_action_type,item_seq_timestamp,target_item_item_id,target_item_category_id,item_seq_length
+1234567_99999,[1234567],"[[11111],[22222],[33333],[44444],[55555]]","[[111],[222],[333],[444],[555]]","[[pv],[clk],[pv],[pv],[atc]]","[[99911],[99933],[99955],[99960],[99999]]",[66666],[666],5
