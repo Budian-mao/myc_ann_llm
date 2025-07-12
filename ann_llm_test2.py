@@ -4,7 +4,8 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import numpy as np
-
+import torch
+import torch.nn.functional as F
 
 # 用户行为序列数据集类（修复数据索引问题）
 class UserSequenceDataset(Dataset):
@@ -125,57 +126,60 @@ class ItemTower(nn.Module):
 
 
 # InfoNCE损失函数
-def info_nce_loss(transformer_output, item_tower_output, temperature=0.1):
+def info_nce_loss(transformer_output, item_tower_output, temperature=0.1, debug=False):
     # 1. 最后维度归一化
-    user_norm = torch.nn.functional.normalize(transformer_output, dim=-1)
-    item_norm = torch.nn.functional.normalize(item_tower_output, dim=-1)
+    user_norm = F.normalize(transformer_output, dim=-1)
+    item_norm = F.normalize(item_tower_output, dim=-1)
 
     # 2. 切片得到 [batch, seq_len-1, dim]
     user_slice = user_norm[:, :-1, :]
     item_slice = item_norm[:, 1:, :]
 
-    # 3. 计算原始retreive_score矩阵 [L, L]，其中L = batch*(seq_len-1)
+    # 3. 计算相似度矩阵 [L, L]，其中L = batch*(seq_len-1)
     batch_size, seq_len_minus_1, dim = user_slice.shape
     L = batch_size * seq_len_minus_1  # 总长度
     user_flat = user_slice.reshape(-1, dim)  # [L, dim]
     item_flat = item_slice.reshape(-1, dim)  # [L, dim]
-    retreive_score = torch.matmul(user_flat, item_flat.T)  # [L, L]
 
-    # 4. 生成positive_score矩阵：对角线保留原始值，其他位置为1e-8
-    positive_score = torch.full_like(retreive_score, 1e-8)  # 初始化全为1e-8
-    diag_indices = torch.arange(L, device=retreive_score.device)  # 对角线索引
-    positive_score[diag_indices, diag_indices] = retreive_score[diag_indices, diag_indices]  # 填充对角线
+    # 计算相似度矩阵 (dot product)
+    sim_matrix = torch.matmul(user_flat, item_flat.T)  # [L, L]
 
-    # 5. 生成neg_score矩阵：每行n对应的样本内部列设为1e-8，其他保留原始值
-    neg_score = retreive_score.clone()  # 复制原始矩阵
-    for n in range(L):
-        k = n // seq_len_minus_1
-        start_col = k * seq_len_minus_1
-        end_col = (k + 1) * seq_len_minus_1
-        neg_score[n, start_col:end_col] = 1e-8
+    # 4. 创建掩码矩阵：正样本位置为1，其他为0
+    mask = torch.zeros_like(sim_matrix)
+    diag_indices = torch.arange(L, device=sim_matrix.device)
+    mask[diag_indices, diag_indices] = 1.0
 
-    # 6. 计算每一行的正样本分数和所有样本分数（使用你的方法）
-    pos_exp = torch.exp(positive_score / temperature)  # 正样本指数
-    neg_exp = torch.exp(neg_score / temperature)  # 负样本指数
+    # 5. 计算InfoNCE损失
+    # 应用温度缩放
+    sim_matrix = sim_matrix / temperature
 
-    pos_sum = torch.sum(pos_exp, dim=1)  # 正样本指数之和
-    all_sum = torch.sum(pos_exp + neg_exp, dim=1)  # 所有样本指数之和
+    # 计算softmax
+    exp_sim = torch.exp(sim_matrix)
 
-    # 7. 计算每个样本的 InfoNCE 损失（等价于 -log(pos_sum/all_sum)）
-    pos_log = torch.log(pos_sum)
-    all_log = torch.log(all_sum)
-    loss_per_sample = -(pos_log - all_log)  # 等价于 -log(pos_sum/all_sum)
+    # 计算每个样本的分母（排除自身的所有样本）
+    # 这里使用掩码排除正样本，同时添加一个很小的值保证数值稳定性
+    denominator = torch.sum(exp_sim * (1 - mask), dim=1, keepdim=True) + 1e-8
 
-    # 8. 计算平均损失
+    # 计算每个样本的损失
+    # 注意：正样本的sim_matrix值已经包含在分子中
+    pos_sim = torch.sum(sim_matrix * mask, dim=1)  # 正样本相似度
+    loss_per_sample = -torch.log(exp_sim[diag_indices, diag_indices] / denominator.squeeze())
+
+    # 计算平均损失
     final_loss = torch.mean(loss_per_sample)
 
-    # 9. 打印中间结果（可选）
-    print(f"positive_score矩阵维度：{positive_score.shape}")
-    print(f"neg_score矩阵维度：{neg_score.shape}")
-    print(f"最终损失: {final_loss.item()}")
+    # 6. 打印中间结果（调试模式）
+    if debug:
+        # 统计正样本和负样本的平均相似度
+        pos_sim_avg = torch.mean(sim_matrix[diag_indices, diag_indices])
+        neg_sim_avg = torch.sum(sim_matrix * (1 - mask)) / (L * (L - 1))
+
+        print(f"Batch大小: {batch_size}, 序列长度: {seq_len_minus_1 + 1}, 总样本数: {L}")
+        print(f"正样本平均相似度: {pos_sim_avg.item():.4f}, 负样本平均相似度: {neg_sim_avg.item():.4f}")
+        print(f"正样本概率分布: {torch.mean(exp_sim[diag_indices, diag_indices] / denominator.squeeze()).item():.4f}")
+        print(f"最终损失: {final_loss.item():.4f}")
 
     return final_loss
-
 
 
 # 主程序
@@ -187,7 +191,7 @@ if __name__ == "__main__":
     hidden_dim = 128
     vocab_size = 100001  # 确保覆盖所有item_id和category_id
     batch_size = 3
-    epochs = 6
+    epochs = 1
     learning_rate = 0.001
 
     # 训练过程
